@@ -1,4 +1,4 @@
-// ======== 配置区 ========
+// ======== 配置区 注意，需要在CF新建kv命名空间，名字叫 APP_STATUS_KV 绑定CF worker ========
 const ACCOUNTS = [
     {
     email: "",
