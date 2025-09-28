@@ -1,0 +1,242 @@
+// ======== 配置区 ========
+const ACCOUNTS = [
+    {
+    email: "",
+    password: "",
+    CHAT_ID: "",
+    BOT_TOKEN: "",
+    apps: [{url: "", name: ""},
+        {url: "", name: ""}]
+  },
+
+    {
+    email: "",
+    password: "",
+    CHAT_ID: "",
+    BOT_TOKEN: "",
+    apps: [{url: "", name: ""},
+        {url: "", name: ""}]
+  }
+];
+
+const REGIONS = {
+  US: { CF_API: "https://api.cf.us10-001.hana.ondemand.com", UAA_URL: "https://uaa.cf.us10-001.hana.ondemand.com", DOMAIN_PATTERN: /\.us10(-001)?\.hana\.ondemand\.com$/ },
+  AP: { CF_API: "https://api.cf.ap21.hana.ondemand.com", UAA_URL: "https://uaa.cf.ap21.hana.ondemand.com", DOMAIN_PATTERN: /\.ap21\.hana\.ondemand\.com$/ }
+};
+
+// ======== 工具函数 ========
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const pad = n => String(n).padStart(2,"0");
+
+function formatShanghaiTime(date) {
+  const utcTime = date.getTime() + (date.getTimezoneOffset() * 60000);
+  const shTime = new Date(utcTime + (8*3600*1000));
+  return `${shTime.getFullYear()}-${pad(shTime.getMonth()+1)}-${pad(shTime.getDate())} ${pad(shTime.getHours())}:${pad(shTime.getMinutes())}`;
+}
+
+function detectRegionFromUrl(url) {
+  for (const [code, cfg] of Object.entries(REGIONS)) if(cfg.DOMAIN_PATTERN.test(url)) return code;
+  return null;
+}
+
+async function cfGET(url, token) {
+  const res = await fetch(url, { headers:{authorization:`Bearer ${token}`}});
+  if (!res.ok) throw new Error(`CF GET ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+async function cfPOST(url, token, payload){
+  const res = await fetch(url, { method: "POST", headers:{authorization:`Bearer ${token}`, "content-type":"application/json"}, body: payload?JSON.stringify(payload):null });
+  if(!res.ok) throw new Error(`CF POST ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+async function getUAAToken(email, password, uaaUrl) {
+  const authHeader = "Basic "+btoa("cf:");
+  const body = new URLSearchParams({ grant_type:"password", username: email, password: password, response_type:"token" });
+  const res = await fetch(`${uaaUrl}/oauth/token`, { method:"POST", headers:{ authorization:authHeader, "content-type":"application/x-www-form-urlencoded" }, body });
+  if(!res.ok) throw new Error(`UAA ${res.status}: ${await res.text()}`);
+  return (await res.json()).access_token;
+}
+
+async function getAppGuid(apiUrl, token, appName){
+  const data = await cfGET(`${apiUrl}/v3/apps?names=${encodeURIComponent(appName)}`, token);
+  if(data.resources && data.resources.length>0) return data.resources[0].guid;
+  throw new Error(`App ${appName} not found`);
+}
+
+async function getAppState(apiUrl, token, appGuid){
+  const data = await cfGET(`${apiUrl}/v3/apps/${appGuid}`, token);
+  return data.state || "UNKNOWN";
+}
+
+async function getWebProcessGuid(apiUrl, token, appGuid){
+  const data = await cfGET(`${apiUrl}/v3/apps/${appGuid}/processes`, token);
+  const webProc = data.resources?.find(p=>p.type==="web")||data.resources?.[0];
+  if(!webProc) throw new Error("No web process found");
+  return webProc.guid;
+}
+
+async function getProcessStats(apiUrl, token, processGuid){
+  const data = await cfGET(`${apiUrl}/v3/processes/${processGuid}/stats`, token);
+  return data;
+}
+
+async function checkAppUrl(url){
+  try { const res = await fetch(url, {method:"GET", signal:AbortSignal.timeout(20000)}); return res.status===200; } 
+  catch(e){return false;}
+}
+
+async function sendTelegramMessage(message, CHAT_ID, BOT_TOKEN){
+  if(!CHAT_ID || !BOT_TOKEN) return;
+  try{ await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{ method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({chat_id: CHAT_ID, text: message, parse_mode:"Markdown"}) }); } 
+  catch(e){console.error("[telegram-error]",e.message);}
+}
+
+// ======== 核心逻辑 ========
+async function ensureAppRunning(account, app, env){
+  const {email, password, CHAT_ID, BOT_TOKEN} = account;
+  const url = app.url;
+  const name = app.name;
+  const regionCode = detectRegionFromUrl(url);
+  if(!regionCode) throw new Error(`Cannot detect region for ${url}`);
+  const regionCfg = REGIONS[regionCode];
+
+  const token = await getUAAToken(email, password, regionCfg.UAA_URL);
+  const appGuid = await getAppGuid(regionCfg.CF_API, token, name);
+  const healthy = await checkAppUrl(url);
+
+  const lastKey = `${email}-${name}`;
+  let lastStatus = false;
+  try{ lastStatus = (await env.APP_STATUS_KV.get(lastKey)) === "true"; } catch(e){ lastStatus = false; }
+
+  if(lastStatus !== healthy){
+    await env.APP_STATUS_KV.put(lastKey, healthy.toString());
+    const msg = healthy
+      ? `✅ *应用恢复*: ${name} (${url})\n账号: ${email}\n时间: ${formatShanghaiTime(new Date())}`
+      : `⚠️ *应用离线*: ${name} (${url})\n账号: ${email}\n时间: ${formatShanghaiTime(new Date())}\n尝试启动...`;
+    await sendTelegramMessage(msg, CHAT_ID, BOT_TOKEN);
+  }
+
+  // 按钮逻辑
+  let status = "停止", buttonDisabled = false;
+  if(healthy){ status = "运行中"; buttonDisabled = true; } 
+  else{
+    const appState = await getAppState(regionCfg.CF_API, token, appGuid);
+    if(appState==="STARTED"){ status="启动中"; buttonDisabled=true; }
+  }
+
+  return {account: email, app: name, url, healthy, status, buttonDisabled};
+}
+
+async function monitorAllApps(env){
+  const promises = [];
+  for(const account of ACCOUNTS){
+    for(const app of account.apps){
+      promises.push(ensureAppRunning(account, app, env).catch(e=>{
+        return {account: account.email, app: app.name, url: app.url, healthy:false, status:"异常", buttonDisabled:true, error:e.message};
+      }));
+    }
+  }
+  const results = await Promise.allSettled(promises);
+  return results.map(r=>r.value);
+}
+
+// ======== HTML 页面生成 ========
+function generateStatusPage(results){
+  let rows = '';
+  results.forEach(r=>{
+    const color = r.healthy?"green": (r.status==="启动中"?"orange":"red");
+    rows += '<tr id="row-' + r.account + '-' + r.app + '">' +
+      '<td>' + r.account + '</td>' +
+      '<td>' + r.app + '</td>' +
+      '<td><a href="' + r.url + '" target="_blank">' + r.url + '</a></td>' +
+      '<td class="status" style="color:' + color + ';font-weight:bold">' + r.status + '</td>' +
+      '<td class="error">' + (r.error?'<span style="color:red">'+r.error+'</span>':'') + '</td>' +
+      '<td><button class="startBtn" onclick="startApp(\''+r.account+'\',\''+r.app+'\')" ' +
+      (r.buttonDisabled?'disabled':'') + '>' +
+      (r.status==="运行中"?"已启动": r.status==="启动中"?"启动中":"手动启动") +
+      '</button></td>' +
+      '</tr>';
+  });
+
+  return '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>SAP 应用状态监控</title><style>' +
+  'body{font-family:sans-serif;background:#f5f5f5;padding:20px}' +
+  'table{border-collapse:collapse;width:100%;background:#fff}' +
+  'th,td{border:1px solid #ddd;padding:8px;text-align:left}' +
+  'th{background:#667eea;color:#fff}' +
+  'tr:hover{background:#f1f1f1}' +
+  'button{padding:4px 8px;cursor:pointer}' +
+  'button[disabled]{cursor:not-allowed;opacity:0.6}' +
+  '</style></head><body>' +
+  '<h2>SAP Cloud 应用状态</h2>' +
+  '<table><tr><th>账号</th><th>应用名称</th><th>URL</th><th>状态</th><th>错误信息</th><th>操作</th></tr>' +
+  rows + '</table>' +
+  '<p>最后更新时间: <span id="lastUpdate">' + formatShanghaiTime(new Date()) + '</span></p>' +
+  '<script>' +
+  'async function startApp(email, app){' +
+  '  const rowId = "row-" + email + "-" + app;' +
+  '  const row = document.getElementById(rowId);' +
+  '  const btn = row.querySelector(".startBtn");' +
+  '  const statusCell = row.querySelector(".status");' +
+  '  btn.disabled = true; btn.textContent = "启动中"; statusCell.textContent = "启动中"; statusCell.style.color = "orange";' +
+  '  try{' +
+  '    const res = await fetch("/start?email=" + encodeURIComponent(email) + "&app=" + encodeURIComponent(app));' +
+  '    alert(await res.text());' +
+  '    setTimeout(async ()=>{' +
+  '      const jsonRes = await fetch("/status-json");' +
+  '      const data = await jsonRes.json();' +
+  '      const appData = data.find(item=>item.account===email && item.app===app);' +
+  '      if(appData){' +
+  '        statusCell.textContent = appData.status;' +
+  '        statusCell.style.color = appData.status==="运行中"?"green":(appData.status==="启动中"?"orange":"red");' +
+  '        btn.disabled = appData.buttonDisabled;' +
+  '        btn.textContent = appData.buttonDisabled? (appData.status==="运行中"?"已启动":"启动中") : "手动启动";' +
+  '      }' +
+  '      document.getElementById("lastUpdate").textContent = new Date().toLocaleString();' +
+  '    },5000);' +
+  '  }catch(e){ alert(e.message); btn.disabled=false; btn.textContent="手动启动"; statusCell.textContent="异常"; statusCell.style.color="red"; }' +
+  '}' +
+  '</script></body></html>';
+}
+
+// ======== Worker 入口 ========
+export default {
+  async fetch(request, env, ctx){
+    try{
+      const url = new URL(request.url);
+
+      if(url.pathname === "/start"){
+        const email = url.searchParams.get("email");
+        const appName = url.searchParams.get("app");
+        if(!email || !appName) return new Response("参数缺失", {status:400});
+        const account = ACCOUNTS.find(a=>a.email===email);
+        if(!account) return new Response("账号不存在", {status:404});
+        const app = account.apps.find(a=>a.name===appName);
+        if(!app) return new Response("应用不存在", {status:404});
+        const regionCode = detectRegionFromUrl(app.url);
+        const regionCfg = REGIONS[regionCode];
+        const token = await getUAAToken(account.email, account.password, regionCfg.UAA_URL);
+        const appGuid = await getAppGuid(regionCfg.CF_API, token, appName);
+        const appState = await getAppState(regionCfg.CF_API, token, appGuid);
+        if(appState!=="STARTED") await cfPOST(`${regionCfg.CF_API}/v3/apps/${appGuid}/actions/start`, token);
+        return new Response("启动指令已发送");
+      }
+
+      if(url.pathname === "/status-json" || url.pathname === "/"){
+        const results = await monitorAllApps(env);
+        return new Response(JSON.stringify(results), {headers:{"content-type":"application/json"}});
+      }
+
+      if(url.pathname === "/status"){
+        const results = await monitorAllApps(env);
+        return new Response(generateStatusPage(results), {headers:{"content-type":"text/html;charset=UTF-8"}});
+      }
+
+      const results = await monitorAllApps(env);
+      return new Response(JSON.stringify(results,null,2), {headers:{"content-type":"application/json"}});
+    }catch(e){
+      return new Response(JSON.stringify({error:e.message}), {status:500,headers:{"content-type":"application/json"}});
+    }
+  }
+};
